@@ -39,7 +39,13 @@ $MeterMs   = if ($MeterMs -gt 0) { $MeterMs } else { 70 }   # 呼吸采样间隔
 $BreathOn  = $true        # 呼吸灯默认开关
 # 呼吸灯只跟随这些进程的音频（不含 .exe）。
 # msedge = 网页版 Apple Music；AppleMusic/Music = 客户端
-$MeterProcs = @('msedge', 'msedgewebview2', 'AppleMusic', 'Music', 'iTunes')
+$MeterProcs = @('msedge', 'AppleMusic', 'Music', 'iTunes')
+  # ★ 刻意【排除 msedgewebview2.exe】—— 那是第三方软件内嵌的 Edge 内核，
+  #   实测腾讯视频就用它。放进来的话球的呼吸和播放控制都会跟着腾讯视频跑。
+
+  # 媒体会话白名单：只认【浏览器本体】和【原生音乐应用】。
+  # 比 MeterProcs 更严：这里绝不能用通配符匹配 msedgewebview2。
+  $SessionApps = @('MSEdge', 'AppleMusic', 'Music', 'iTunes')
 $AppleMusicUrl = 'https://music.apple.com/'   # 中键单击打开这个地址
 $ExtensionId   = 'gnkgbjakjmedbebcelkfkcijjbpeiljh'  # 歌单管家扩展 ID
 $PanelSize     = '470,820'    # 歌单面板窗口大小（宽,高）
@@ -442,13 +448,36 @@ try {
     # ======================= 媒体读取 =======================
     $script:Sess = $null
     $script:LastKey = ''
+    # 判断某个会话是不是【音乐类应用】的。
+    # 必须过滤：Chromium 在暂停久了之后会撤销 Apple Music 的媒体会话，
+    # 于是 GetCurrentSession() 返回的是【别的应用】（实测切到了腾讯视频），
+    # 球就会一直去控制那个应用 —— 比"控制失败"更糟，是误操作。
+    function Test-MusicApp($sess) {
+        try {
+            $id = "$($sess.SourceAppUserModelId)"
+            # ★ 必须先排除：'msedgewebview2.exe' 以 "msedge" 开头，
+            #   任何 *MSEdge* 形式的通配符都会把它放行（-like 不区分大小写）。
+            if ($id -like '*msedgewebview2*') { return $false }
+            # Edge 浏览器本体：AUMID 就是精确的 'MSEdge'
+            if ($id -eq 'MSEdge') { return $true }
+            if ($id -like '*MicrosoftEdge*') { return $true }
+            # 原生音乐应用
+            foreach ($n in @('AppleMusic', 'iTunes')) {
+                if ($id -like "*$n*") { return $true }
+            }
+        } catch { }
+        return $false
+    }
 
     function Get-CurrentSession {
         try {
-            $s = $script:Mgr.GetCurrentSession()
-            if ($s) { return $s }
-            $all = @($script:Mgr.GetSessions())
-            if ($all.Count -gt 0) { return $all[0] }
+            # 优先用系统的"当前会话"，但必须是音乐类应用
+            $cur = $script:Mgr.GetCurrentSession()
+            if ($cur -and (Test-MusicApp $cur)) { return $cur }
+            # 否则在全部会话里找第一个音乐类应用的
+            foreach ($x in @($script:Mgr.GetSessions())) {
+                if (Test-MusicApp $x) { return $x }
+            }
         } catch { }
         return $null
     }
@@ -647,6 +676,32 @@ try {
             Write-Log "呼吸灯: $($script:BreathOn)"
         })
     $menu.Items.Add($miBreath) | Out-Null
+
+    # ---- 诊断：把所有媒体会话打进日志（排查"控制错程序/控制失效"用）----
+    $miDiag = New-Object System.Windows.Controls.MenuItem
+    $miDiag.Header = '诊断：列出媒体会话'
+    $miDiag.Add_Click({
+            try {
+                Write-Log '===== 媒体会话诊断 ====='
+                $all = @($script:Mgr.GetSessions())
+                Write-Log "会话总数: $($all.Count)"
+                foreach ($s in $all) {
+                    $st = '?'
+                    try { $st = "$($s.GetPlaybackInfo().PlaybackStatus)" } catch { }
+                    $isM = Test-MusicApp $s
+                    Write-Log ("  app=[" + "$($s.SourceAppUserModelId)" + "] status=$st 音乐类=" + $isM)
+                }
+                $cur = $script:Mgr.GetCurrentSession()
+                Write-Log ("系统当前会话: " + $(if ($cur) { "[$($cur.SourceAppUserModelId)]" } else { '（无）' }))
+                $pick = Get-CurrentSession
+                Write-Log ("球选中的会话: " + $(if ($pick) { "[$($pick.SourceAppUserModelId)]" } else { '（无 → 点球会去打开 Apple Music）' }))
+                Write-Log '===== 诊断结束 ====='
+                [System.Windows.MessageBox]::Show('诊断结果已写入 ball.log', '悬浮球', 'OK', 'Information') | Out-Null
+            } catch {
+                Write-Log "诊断失败: $($_.Exception.Message)"
+            }
+        })
+    $menu.Items.Add($miDiag) | Out-Null
 
     $menu.Items.Add((New-Object System.Windows.Controls.Separator)) | Out-Null
 
