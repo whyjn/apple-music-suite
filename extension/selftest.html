@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Apple Music 歌单管家 · 连通性自检</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px;
+    font: 13px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #14161c; color: #e8eaf0;
+  }
+  h1 { font-size: 15px; margin: 0 0 4px; font-weight: 600; }
+  .sub { color: #8b93a7; font-size: 12px; }
+  .card {
+    background: #1c1f28; border: 1px solid #2b2f3b; border-radius: 10px;
+    padding: 12px; margin-top: 12px;
+  }
+  .card h2 { font-size: 13px; margin: 0 0 2px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .badge { font-size: 11px; padding: 1px 7px; border-radius: 20px; font-weight: 600; }
+  .pass { background: #14361f; color: #4ade80; border: 1px solid #22663a; }
+  .fail { background: #3a1717; color: #f87171; border: 1px solid #7f2c2c; }
+  .wait { background: #2b2f3b; color: #9aa3b8; }
+  pre {
+    margin: 6px 0 0; padding: 8px; background: #0f1116; border-radius: 6px;
+    font: 11px/1.5 "Cascadia Mono", Consolas, monospace;
+    color: #a8b2c8; white-space: pre-wrap; word-break: break-all;
+    max-height: 170px; overflow: auto;
+  }
+  .kv { display: flex; gap: 8px; margin: 2px 0; font-size: 12px; }
+  .kv b { color: #8b93a7; font-weight: 500; min-width: 76px; flex: none; }
+  .kv span { word-break: break-all; }
+  button {
+    background: #2d63ff; color: #fff; border: 0; border-radius: 7px;
+    padding: 8px 14px; font-size: 13px; cursor: pointer; font-family: inherit;
+  }
+  button:hover { background: #4275ff; }
+  .summary { font-size: 13px; padding: 12px; border-radius: 10px; margin-top: 12px; }
+  .summary.good { background: #14361f; border: 1px solid #22663a; color: #86efac; }
+  .summary.bad  { background: #3a1717; border: 1px solid #7f2c2c; color: #fca5a5; }
+  .summary.mid  { background: #22252e; border: 1px solid #2b2f3b; color: #9aa3b8; }
+  .note { font-size: 11px; color: #7a8296; margin-top: 3px; }
+</style>
+</head>
+<body>
+  <h1>连通性自检 v2 <span style="font:11px sans-serif;color:#6b7280;font-weight:400">build 3.0.1</span></h1>
+  <div class="sub">验证扩展页面能否调用 Apple Music API —— 决定 P2 独立窗口的传输方案</div>
+
+  <div id="summary" class="summary mid">正在检测…</div>
+
+  <div class="card">
+    <h2>0. 扩展与凭证</h2>
+    <div id="env"></div>
+  </div>
+
+  <div class="card">
+    <h2>1. 面板直连 amp-api <span id="b1" class="badge wait">等待</span></h2>
+    <div class="note">扩展页面直接 fetch。已启用 DNR 改写 Origin / Referer。</div>
+    <div id="r1"></div>
+  </div>
+
+  <div class="card">
+    <h2>2. 经后台 Service Worker <span id="b2" class="badge wait">等待</span></h2>
+    <div class="note">由后台发起，同样走 DNR 改写。</div>
+    <div id="r2"></div>
+  </div>
+
+  <div class="card">
+    <h2>3. 经内容脚本（页面源） <span id="b3" class="badge wait">等待</span></h2>
+    <div class="note">请求回到 music.apple.com 页面里发出，Origin 天然正确 —— 理论上必然可行。</div>
+    <div id="r3"></div>
+  </div>
+
+  <div class="card">
+    <h2>4. 面板直连 api（对照组） <span id="b4" class="badge wait">等待</span></h2>
+    <div class="note">公共 API 主机。</div>
+    <div id="r4"></div>
+  </div>
+
+  <div style="margin-top:14px">
+    <button id="again">重新检测</button>
+  </div>
+
+  <script src="selftest.js"></script>
+</body>
+</html>

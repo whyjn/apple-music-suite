@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "Apple Music 歌单管家",
+  "version": "3.5.0",
+  "description": "Apple Music 歌单管家 —— 独立歌单小窗口 + 桌面悬浮球。",
+  "icons": {
+    "128": "icon128.png"
+  },
+  "permissions": [
+    "storage",
+    "scripting",
+    "declarativeNetRequestWithHostAccess"
+  ],
+  "host_permissions": [
+    "https://music.apple.com/*",
+    "https://api.music.apple.com/*",
+    "https://amp-api.music.apple.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "打开歌单小窗口",
+    "default_icon": {
+      "128": "icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://music.apple.com/*"],
+      "js": ["bridge.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://music.apple.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    }
+  ]
+}

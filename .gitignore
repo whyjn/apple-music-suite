@@ -1,0 +1,19 @@
+# ---------- 运行时产物（每台机器不同，不要提交）----------
+desktop-ball/ball.log
+desktop-ball/ball-position.json
+extension/*.log
+
+# ---------- 系统 ----------
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---------- 编辑器 ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---------- 临时文件 ----------
+*.tmp
+_preview*.png

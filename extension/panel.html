@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Apple Music 歌单管家</title>
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    width: 100%; height: 100%;
+    background: #0e0e14;
+    overflow: hidden;
+  }
+</style>
+</head>
+<body>
+  <!--
+    独立面板窗口。
+    这里直接加载与网页挂件同一份 content.js —— 它通过 location.protocol
+    自动识别出「独立窗口模式」，于是：
+      · 从扩展后台取凭证（而不是从页面抓）
+      · 隐藏挂件球，面板铺满窗口
+      · 其余 UI / API / 流程代码 100% 复用
+  -->
+  <script src="content.js"></script>
+</body>
+</html>
