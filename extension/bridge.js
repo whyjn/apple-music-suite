@@ -134,7 +134,24 @@
     false
   );
 
-  /* ---------------- 5. 告诉后台这个页面已就绪 ---------------- */
+  /* ---------------- 5. 页面日志中继（回传到面板窗口） ---------------- */
+  window.addEventListener(
+    'message',
+    function (ev) {
+      if (ev.source !== window) return;
+      const d = ev.data;
+      if (!d || typeof d !== 'object' || !d.__am_log__) return;
+      try {
+        chrome.runtime.sendMessage(
+          { type: 'am-page-log', msg: d.__am_log__.msg, cls: d.__am_log__.cls },
+          function () { void chrome.runtime.lastError; }
+        );
+      } catch (e) {}
+    },
+    false
+  );
+
+  /* ---------------- 6. 告诉后台这个页面已就绪 ---------------- */
   try {
     chrome.runtime.sendMessage({ type: 'am-page-ready' }, function () {
       void chrome.runtime.lastError;

@@ -487,15 +487,20 @@
     if (!list.length) return '失败：没有可播放的曲目（可能都是本地上传）';
 
     const target = startWith && list.indexOf(String(startWith)) >= 0 ? String(startWith) : list[0];
-    log('准备播放：队列 ' + list.length + ' 首，起点 ' + target, 'info');
+
+    // ★ MusicKit 会【静默忽略】startWithSong（库内歌曲尤其如此）：
+    //   队列建成功、返回 ok，但从第 1 首开始播 —— 表现为"点第 4 首却播了第 1 首"。
+    //   解法：把目标曲目直接排到队列最前面，不依赖那个参数。
+    const ti = list.indexOf(target);
+    const ordered = ti > 0 ? [target].concat(list.filter((x) => x !== target)) : list;
+    log('准备播放：队列 ' + ordered.length + ' 首，起点索引 ' + (ti < 0 ? 0 : ti) + ' → ' + target, 'info');
 
     // 分级降级：整单队列 → 单曲队列（单曲是最稳的，最早那版已验证可用）
     let ok = false;
-    if (list.length > 1) {
-      ok = await tryQueue(inst, { songs: list, startWithSong: target }, '整单队列(' + list.length + '首)');
+    if (ordered.length > 1) {
+      ok = await tryQueue(inst, { songs: ordered, startWithSong: target }, '整单队列(' + ordered.length + '首)');
     }
     if (!ok) ok = await tryQueue(inst, { song: target }, '单曲队列');
-    if (!ok) return '失败：setQueue 全部超时或出错';
 
     let r;
     try {
@@ -729,7 +734,14 @@
   const $ = (id) => (host ? host.shadowRoot.getElementById(id) : null);
 
   function log(msg, cls) {
-    if (!logEl) return;
+    if (!logEl) {
+      // 页面侧（网页挂件关闭时 logEl 为空）：把日志中继回面板窗口，
+      // 否则页面里发生了什么完全看不到，排查只能靠猜。
+      if (!PANEL_MODE) {
+        try { window.postMessage({ __am_log__: { msg: String(msg), cls: cls || '' } }, '*'); } catch (e) {}
+      }
+      return;
+    }
     const d = document.createElement('div');
     d.className = 'lg ' + (cls || '');
     d.textContent = msg;
@@ -1025,6 +1037,13 @@
       if (wb) wb.style.display = 'none';
       const hb = $('hintbar');
       if (hb) hb.style.display = 'flex';
+
+      // 接收【页面侧】中继过来的日志，加上 [网页] 前缀，方便区分来源
+      try {
+        chrome.runtime.onMessage.addListener((m) => {
+          if (m && m.type === 'am-log') log('[网页] ' + m.msg, m.cls || 'info');
+        });
+      } catch (e) {}
     }
     /* 独立窗口：优先采用桌面悬浮球通过 URL 传来的颜色，做到两处一致 */
     let initTint = LS.get('tint', '168,200,240');

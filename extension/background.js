@@ -304,6 +304,17 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
     return true;
   }
 
+  if (msg.type === 'am-page-log') {
+    // 广播给所有扩展页面（面板窗口）；内容脚本收不到，不会回环
+    try {
+      chrome.runtime.sendMessage({ type: 'am-log', msg: msg.msg, cls: msg.cls }, function () {
+        void chrome.runtime.lastError;
+      });
+    } catch (e) {}
+    sendResponse({ ok: true });
+    return true;
+  }
+
   if (msg.type === 'am-open-panel') {
     openPanel();
     sendResponse({ ok: true });
