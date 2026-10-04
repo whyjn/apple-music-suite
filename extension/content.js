@@ -746,6 +746,8 @@
     d.className = 'lg ' + (cls || '');
     d.textContent = msg;
     logEl.appendChild(d);
+    // ★ 上限 300 行：日志回传后会持续 append，不裁剪的话 DOM 节点会一直堆积
+    while (logEl.childNodes.length > 300) logEl.removeChild(logEl.firstChild);
     logEl.scrollTop = logEl.scrollHeight;
   }
   function clearLog() { if (logEl) logEl.innerHTML = ''; }

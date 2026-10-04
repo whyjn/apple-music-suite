@@ -55,9 +55,23 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LogFile   = Join-Path $ScriptDir 'ball.log'
 $PosFile   = Join-Path $ScriptDir 'ball-position.json'
 
+$script:LogWrites = 0
 function Write-Log($msg) {
     try {
         Add-Content -LiteralPath $LogFile -Value ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $msg) -Encoding UTF8
+
+        # ★ 日志轮转：不控制的话它每天涨 ~150KB、一年 ~55MB，永不回收。
+        #   每 200 次写入才查一次文件大小（避免每次都 stat）。
+        $script:LogWrites++
+        if ($script:LogWrites % 200 -eq 0) {
+            $fi = Get-Item -LiteralPath $LogFile -ErrorAction SilentlyContinue
+            if ($fi -and $fi.Length -gt 524288) {
+                # 超过 512KB 就只保留最近 300 行
+                $keep = @(Get-Content -LiteralPath $LogFile -Tail 300 -Encoding UTF8)
+                [System.IO.File]::WriteAllLines($LogFile, $keep, (New-Object System.Text.UTF8Encoding($true)))
+                Add-Content -LiteralPath $LogFile -Value ("[{0}] （日志已截断，仅保留最近 300 行）" -f (Get-Date -Format 'HH:mm:ss')) -Encoding UTF8
+            }
+        }
     } catch { }
 }
 
