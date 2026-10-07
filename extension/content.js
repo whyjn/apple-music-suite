@@ -290,26 +290,43 @@
             } else if (a === 'next' || a === 'prev') {
               // ★ 不再无条件报成功：记录调用前的曲目，调用后【验证是否真的换了】
               const before = (inst.nowPlayingItem && inst.nowPlayingItem.id) || '';
-              try {
-                if (a === 'next') { if (inst.skipToNextItem) await inst.skipToNextItem(); }
-                else { if (inst.skipToPreviousItem) await inst.skipToPreviousItem(); }
-              } catch (e) { out.error = String((e && e.message) || e); }
-              await new Promise((r) => setTimeout(r, 700));
-
-              const after = (inst.nowPlayingItem && inst.nowPlayingItem.id) || '';
-              if (after && after !== before) { out.ok = true; out.via = 'MusicKit'; }
-              else {
-                // MusicKit 没动 → 直接点网页自己的按钮（最可靠）
-                const el = findTransportBtn(a);
-                if (!el) {
-                  out.error = (out.error ? out.error + '；' : '') +
-                    'MusicKit 未换歌，且找不到网页的' + (a === 'next' ? '下一首' : '上一首') + '按钮';
-                } else {
-                  el.click();
+              // ★ 优先走「自己算下标 + 单曲队列 + 验证起点」的换歌逻辑：
+              //   原生 skipToNextItem 遇到坏曲目会回卷到第 1 首（实测），
+              //   而且单曲队列里它根本没得跳。绝不因为一首歌坏了就回到队首。
+              const step = await goAdjacent(a === 'next' ? 1 : -1,
+                (a === 'next' ? '下一首' : '上一首') + '（面板或悬浮球）');
+              if (step && step.ok) {
+                out.ok = true;
+                out.via = step.via;
+              } else {
+                out.error = (step && step.error) || '';
+                if (step && step.noCtx) {
+                  // 没有曲目上下文（例如只在页面手动播了一首）→ 才退回原生 skip + 网页按钮
+                  try {
+                    if (a === 'next') { if (inst.skipToNextItem) await inst.skipToNextItem(); }
+                    else { if (inst.skipToPreviousItem) await inst.skipToPreviousItem(); }
+                  } catch (e) { out.error = (out.error ? out.error + '；' : '') + String((e && e.message) || e); }
                   await new Promise((r) => setTimeout(r, 700));
-                  const a2 = (inst.nowPlayingItem && inst.nowPlayingItem.id) || '';
-                  if (a2 && a2 !== before) { out.ok = true; out.via = '网页按钮'; }
-                  else out.error = 'MusicKit 和网页按钮都没能换歌（可能已在队列首/尾）';
+
+                  const after = (inst.nowPlayingItem && inst.nowPlayingItem.id) || '';
+                  if (after && after !== before) { out.ok = true; out.via = 'MusicKit 原生 skip'; }
+                  else {
+                    // MusicKit 没动 → 直接点网页自己的按钮（最可靠）
+                    const el = findTransportBtn(a);
+                    if (!el) {
+                      out.error = (out.error ? out.error + '；' : '') +
+                        'MusicKit 未换歌，且找不到网页的' + (a === 'next' ? '下一首' : '上一首') + '按钮';
+                    } else {
+                      el.click();
+                      await new Promise((r) => setTimeout(r, 700));
+                      const a2 = (inst.nowPlayingItem && inst.nowPlayingItem.id) || '';
+                      if (a2 && a2 !== before) { out.ok = true; out.via = '网页按钮'; }
+                      else out.error = 'MusicKit 和网页按钮都没能换歌（可能已在队列首/尾）';
+                    }
+                  }
+                } else {
+                  // 已经到队首/队尾：宁可停在当前曲目，也不回卷到第 1 首
+                  out.error = (out.error ? out.error + '；' : '') + '不向前跳也不回到队首，已停在当前曲目';
                 }
               }
             } else throw new Error('未知指令 ' + a);
@@ -440,6 +457,65 @@
     return null;
   }
 
+  // ★ 实证记录：播放时被目录接口判定【已失效】的 id。
+  //   只用于在面板曲目列表上打 ⚠ 角标，绝不会因此剔除曲目。
+  const badIds = new Set();
+
+  // 批量确认这些 id 在目录里是否还存在。
+  // 库内 id（i.xxx）无法用目录接口校验 —— 它们不会让 setQueue 失败，先当作有效放行。
+  // 返回值里额外带上 names（id → '歌名 / 歌手'）：这份目录响应本来就要发，
+  // 顺手留下歌名后，页面侧日志（包括面板转发过来的播放）也能打出歌名而不是一坨 id。
+  async function filterPlayableIds(ids) {
+    const list = [...new Set((ids || []).filter(Boolean).map(String))];
+    const libIds = list.filter((x) => x.indexOf('i.') === 0);
+    const catIds = list.filter((x) => x.indexOf('i.') !== 0);
+    const okCat = [];
+    const bad = [];
+    const names = {};
+    for (let i = 0; i < catIds.length; i += 100) {      // 接口单次上限约 100 个
+      const chunk = catIds.slice(i, i + 100);
+      const got = new Set();
+      try {
+        const j = await apiFetch('/v1/catalog/' + storefront + '/songs?ids=' + chunk.join(','));
+        ((j && j.data) || []).forEach((s) => {
+          if (!s || !s.id) return;
+          got.add(String(s.id));
+          const a = s.attributes || {};
+          names[String(s.id)] = [a.name, a.artistName].filter(Boolean).join(' / ');
+        });
+      } catch (e) {
+        // 校验请求本身失败（网络/限流）→ 不能因噎废食，全部放行，交给后面的降级逻辑
+        log('⚠ 目录校验失败，这批 id 全部按有效处理：' + ((e && e.message) || e), 'warn');
+        return { ok: list, bad: [], names: names };
+      }
+      chunk.forEach((id) => { if (got.has(id)) okCat.push(id); else bad.push(id); });
+    }
+    // 保险：如果【所有】目录 id 都被判失效，更可能是校验本身不可信
+    // （商店区不对 / 接口返回异常），而不是歌真的都没了 → 全部放行，别把整个歌单清空。
+    if (catIds.length > 1 && bad.length === catIds.length) {
+      log('⚠ 目录里一个都没查到（共 ' + catIds.length + ' 个），判定为校验不可信，全部按有效处理', 'warn');
+      return { ok: list, bad: [], names: names };
+    }
+    return { ok: okCat.concat(libIds), bad: bad, names: names };
+  }
+
+  // 「歌名 / 歌手」——只给日志用（拿不到就返回空串）
+  function trackNameOf(item) {
+    const a = (item && item.attributes) || {};
+    return [a.name, a.artistName].filter(Boolean).join(' / ');
+  }
+
+  // 用一份曲目列表做「id → 歌名」映射，返回一个 (id) => 歌名 的函数。
+  // 只在【本进程】使用：面板模式下它由面板自己的曲目列表生成，不跨进程传递。
+  function nameMapperOf(items) {
+    const m = new Map();
+    (items || []).forEach((it) => {
+      const id = catalogIdOf(it);
+      if (id && !m.has(id)) m.set(id, trackNameOf(it));
+    });
+    return (id) => m.get(String(id)) || '';
+  }
+
   function playStateText() {
     if (PANEL_MODE) return '播放由网页播放器执行（暂停/切歌用桌面悬浮球）';
     const inst = tryMusicKit();
@@ -496,6 +572,31 @@
     try { fn(inst); } catch (e) { log('播放控制失败：' + e.message, 'err'); }
   }
 
+  // 上一首 / 下一首（挂件按钮）：
+  //   面板模式 → 照旧转发给网页（网页侧现在也走下面这套自管切歌逻辑）
+  //   网页模式 → 自己算下标 + 单曲队列 + 验证起点，不再用原生 skipToNextItem
+  //              （原生 skip 遇到坏曲目会回卷到第 1 首，单曲队列里更是无从下手）
+  function ctrlStep(delta, action) {
+    if (PANEL_MODE) {
+      ctrl(function () {}, action);
+      return;
+    }
+    const inst = tryMusicKit();
+    if (!inst) {
+      log('播放器未就绪。请先用页面底部播放条手动播放一次，再回来控制。', 'warn');
+      log('诊断：' + mkDiag(), 'warn');
+      return;
+    }
+    goAdjacent(delta, action === 'next' ? '下一首（挂件按钮）' : '上一首（挂件按钮）').then((r) => {
+      if (!r || !r.ok) log('播放控制失败：' + ((r && r.error) || '网页端未响应'), 'err');
+      else log('播放控制：' + action + (r.via ? '（' + r.via + '）' : ''), 'ok');
+      setTimeout(() => {
+        const el = $('npText');
+        if (el) el.textContent = playStateText();
+      }, 400);
+    });
+  }
+
   // MusicKit 的 Promise 有时永不 settle，必须加超时，否则调用方会永久卡住
   function withTimeout(promise, ms) {
     return Promise.race([
@@ -520,46 +621,401 @@
     return r === 'ok';
   }
 
-  async function playSongIds(ids, startWith) {
-    /* 独立面板窗口没有 MusicKit —— 把播放指令转给网页执行 */
-    if (PANEL_MODE) return await playViaPage(ids, startWith);
+  /* ============ 队列播放上下文（页面模式）· 起点必须自己说了算 ============
+   * 实测结论（用户日志）：
+   *   setQueue({ songs: [...N首] }) → 起点总落在第 1 首
+   *   setQueue({ song: 单首 })      → 起点永远正确
+   * 所以这里保存一份「经过校验的曲目列表 + 当前下标」：
+   *   起点校正 / 下一首 / 上一首 / 自动续播 / 跳过坏曲目 全部由我们自己按下标算，
+   *   再用单曲队列播放并【验证 nowPlayingItem.id】，绝不依赖多曲队列的起点。
+   * API 依据：MusicKit JS v3 的公开实例上确实有
+   *   queue.items / queue.indexForItem(id) / changeToMediaAtIndex(i) / changeToMediaItem(item)
+   *   （已直接从 js-cdn.music.apple.com/musickit/v3/musickit.js 源码里核对过）。
+   * ===================================================================== */
+  const pbCtx = { ids: [], idx: -1, nameOf: null };
+  let pbSkipStreak = 0;              // 连续跳过（坏曲目）次数，防无限循环
+  let pbSkipAt = 0;                  // 最近一次跳过的时刻
+  let pbWrapLogged = '';             // 「回卷到队首」日志去重
+  let pbAdvancing = false;           // 自动续播防重入
+  let pbListenersMounted = false;    // MusicKit 事件是否已挂
+  const runtimeBadIds = new Set();   // 运行时实测播不起来的 id（与目录校验的 badIds 分开）
 
-    const inst = tryMusicKit();
-    if (!inst) return '失败：播放器未就绪（' + mkDiag() + '）';
-    const list = ids.filter(Boolean).map(String);
-    if (!list.length) return '失败：没有可播放的曲目（可能都是本地上传）';
+  function setPlayCtx(ids, idx, nameOf) {
+    pbCtx.ids = (ids || []).filter(Boolean).map(String);
+    pbCtx.idx = typeof idx === 'number' && idx >= 0 ? idx : -1;
+    pbCtx.nameOf = typeof nameOf === 'function' ? nameOf : null;
+  }
 
-    const target = startWith && list.indexOf(String(startWith)) >= 0 ? String(startWith) : list[0];
+  // 当前播放曲目的 id / 歌名（读不到返回空串）
+  function npId(inst) {
+    try {
+      const np = inst && inst.nowPlayingItem;
+      return np && np.id ? String(np.id) : '';
+    } catch (e) { return ''; }
+  }
 
-    // ★ MusicKit 会【静默忽略】startWithSong（库内歌曲尤其如此）：
-    //   队列建成功、返回 ok，但从第 1 首开始播 —— 表现为"点第 4 首却播了第 1 首"。
-    //   解法：把目标曲目直接排到队列最前面，不依赖那个参数。
-    const ti = list.indexOf(target);
-    const ordered = ti > 0 ? [target].concat(list.filter((x) => x !== target)) : list;
-    log('准备播放：队列 ' + ordered.length + ' 首，起点索引 ' + (ti < 0 ? 0 : ti) + ' → ' + target, 'info');
+  function npTitle(inst) {
+    try {
+      const np = inst && inst.nowPlayingItem;
+      const a = (np && np.attributes) || {};
+      return [a.name, a.artistName].filter(Boolean).join(' / ');
+    } catch (e) { return ''; }
+  }
 
-    // 分级降级：整单队列 → 单曲队列（单曲是最稳的，最早那版已验证可用）
-    let ok = false;
-    if (ordered.length > 1) {
-      ok = await tryQueue(inst, { songs: ordered, startWithSong: target }, '整单队列(' + ordered.length + '首)');
+  function queueLen(inst) {
+    try {
+      const q = inst && inst.queue;
+      if (!q) return -1;
+      const items = q.items;
+      if (items && typeof items.length === 'number') return items.length;
+      return typeof q.length === 'number' ? q.length : -1;
+    } catch (e) { return -1; }
+  }
+
+  // 某个 id 在【MusicKit 真实队列】里的下标（找不到返回 -1）
+  function queueIndexOf(inst, id) {
+    const want = String(id || '');
+    if (!want) return -1;
+    try {
+      const q = inst && inst.queue;
+      if (!q) return -1;
+      if (typeof q.indexForItem === 'function') {
+        const i = q.indexForItem(want);
+        if (typeof i === 'number' && i >= 0) return i;
+      }
+      const items = q.items || [];
+      for (let i = 0; i < items.length; i++) {
+        if (items[i] && String(items[i].id) === want) return i;
+      }
+    } catch (e) {}
+    return -1;
+  }
+
+  // 曲名：优先用调用方传进来的 nameOf，拿不到再退回落当前播放项
+  function pbTitleOf(id, inst) {
+    let nm = '';
+    try { if (pbCtx.nameOf) nm = String(pbCtx.nameOf(id) || ''); } catch (e) { nm = ''; }
+    if (!nm && id && String(id) === npId(inst)) nm = npTitle(inst);
+    return nm || String(id);
+  }
+
+  // 等 nowPlayingItem 稳定下来（MusicKit 起播是异步的，立刻读会读到空）
+  async function waitNowPlaying(inst, ms) {
+    const t0 = Date.now();
+    let last = '';
+    let same = 0;
+    while (Date.now() - t0 < ms) {
+      const id = npId(inst);
+      if (id && id === last) {
+        same += 1;
+        if (same >= 2) return id;
+      } else same = 0;
+      last = id;
+      await new Promise((r) => setTimeout(r, 220));
     }
-    if (!ok) ok = await tryQueue(inst, { song: target }, '单曲队列');
+    return last;
+  }
 
+  // play() + 校验起点：只有 nowPlayingItem.id === 目标才算成功（不假设成功）
+  async function playAndVerify(inst, target) {
+    const want = String(target);
     let r;
     try {
       r = await withTimeout(inst.play(), 6000);
     } catch (e) {
-      return '失败：play 抛错 ' + ((e && e.message) || e);
+      log('    play 抛错 ' + ((e && e.message) || e), 'warn');
+      return false;
     }
     log('    play → ' + r, r === 'ok' ? 'ok' : 'warn');
-    return r === 'ok' ? 'MusicKit' : '失败：play ' + r;
+    const cur = await waitNowPlaying(inst, 3200);
+    const good = cur === want;
+    log('起点校验：实际 nowPlaying=' + (cur || '(读不到)') + '，目标 ' + want + (good ? ' ✓' : ' ✗'), good ? 'ok' : 'warn');
+    if (good) {
+      // ★ 起点对了不等于真的出声了（坏曲目常常"id 换上了但播不动"）。
+      //   这里把状态也写进日志，随后由看门狗在约 6 秒后接管、跳到下一首。
+      let ip = false;
+      let pos = 0;
+      let st = -1;
+      try {
+        ip = inst.isPlaying === true;
+        pos = Number(inst.currentPlaybackTime) || 0;
+        st = inst.playbackState;
+      } catch (e) {}
+      if (ip || pos > 0) log('    （已出声：isPlaying=' + ip + '，位置=' + pos.toFixed(1) + '）', 'ok');
+      else log('    ⚠ 起点对了但还没出声（isPlaying=false，位置 0，playbackState=' + st + '）——约 6 秒仍无进展就跳到下一首', 'warn');
+    }
+    return good;
+  }
+
+  // 单曲队列 + 校验（这个项目里历史上最稳的路径）
+  async function playSingleVerified(inst, id, label) {
+    const ok = await tryQueue(inst, { song: String(id) }, label || '单曲队列');
+    if (!ok) return false;
+    return await playAndVerify(inst, id);
+  }
+
+  // 多曲队列建好后：试着把起点「校正」到目标曲目。
+  //   ① changeToMediaAtIndex(目标在真实队列里的下标)
+  //   ② changeToMediaItem(队列里的那个 item 对象)
+  // 每一步都读 nowPlayingItem.id 验证；能力不存在时【如实记日志】，不静默跳过。
+  async function correctQueueStart(inst, target) {
+    const want = String(target);
+    const idx = queueIndexOf(inst, want);
+    log('    真实队列：长度=' + queueLen(inst) + '，目标下标=' + (idx < 0 ? '不在队列里' : idx), idx < 0 ? 'warn' : 'info');
+    if (idx < 0) {
+      log('    ⚠ 目标不在 MusicKit 的真实队列里（多是被判定不可播放/受地区限制而被剔除）', 'err');
+      return false;
+    }
+
+    if (typeof inst.changeToMediaAtIndex === 'function') {
+      log('  ▸ 起点校正：changeToMediaAtIndex(' + idx + ') …', 'info');
+      const r1 = await withTimeout(inst.changeToMediaAtIndex(idx), 6000);
+      log('    changeToMediaAtIndex(' + idx + ') → ' + r1, r1 === 'ok' ? 'ok' : 'warn');
+      const cur = await waitNowPlaying(inst, 2600);
+      const good = cur === want;
+      log('起点校正：changeToMediaAtIndex(' + idx + ') → 实际 nowPlaying=' + (cur || '(读不到)') + (good ? ' ✓' : ' ✗'), good ? 'ok' : 'warn');
+      if (good) return true;
+    } else {
+      log('  ▸ 起点校正：本版 MusicKit 没有 changeToMediaAtIndex，跳过这一步', 'warn');
+    }
+
+    if (typeof inst.changeToMediaItem === 'function') {
+      let item = null;
+      try {
+        const items = inst.queue && inst.queue.items;
+        item = items ? items[idx] : null;
+      } catch (e) { item = null; }
+      if (!item) {
+        log('  ▸ 起点校正：拿不到队列里的 item 对象，跳过 changeToMediaItem', 'warn');
+        return false;
+      }
+      log('  ▸ 起点校正：changeToMediaItem(' + (item.id || '?') + ') …', 'info');
+      const r2 = await withTimeout(inst.changeToMediaItem(item), 6000);
+      log('    changeToMediaItem → ' + r2, r2 === 'ok' ? 'ok' : 'warn');
+      const cur2 = await waitNowPlaying(inst, 2600);
+      const good2 = cur2 === want;
+      log('起点校正：changeToMediaItem → 实际 nowPlaying=' + (cur2 || '(读不到)') + (good2 ? ' ✓' : ' ✗'), good2 ? 'ok' : 'warn');
+      if (good2) return true;
+    } else {
+      log('  ▸ 起点校正：本版 MusicKit 没有 changeToMediaItem，跳过这一步', 'warn');
+    }
+    return false;
+  }
+
+  // 实际 nowPlaying 在我们列表里的下标（-1 = 不在列表里）
+  function actualIdxIn(inst) {
+    const id = npId(inst);
+    return id ? pbCtx.ids.indexOf(id) : -1;
+  }
+
+  // 把实际播放同步进上下文：
+  //   往前走（含原生自动续播、原生跳过坏曲目）→ 认；
+  //   正好退一首 → 认（用户点了上一首）；
+  //   明显往回跳（坏曲目导致 MusicKit 回卷到第 1 首）→ 只记日志，【不改我们的进度】。
+  function syncCtxIdx(inst) {
+    const a = actualIdxIn(inst);
+    if (a < 0 || pbCtx.idx < 0 || a === pbCtx.idx) return;
+    if (a > pbCtx.idx || a === pbCtx.idx - 1) { pbCtx.idx = a; return; }
+    const key = a + '>' + pbCtx.idx;
+    if (pbWrapLogged === key) return;
+    pbWrapLogged = key;
+    log('⚠ 播放位置往回跳到第 ' + (a + 1) + ' 首（我们记录的进度是第 ' + (pbCtx.idx + 1) + ' 首），已忽略这次回卷', 'warn');
+  }
+
+  // 「下一首」的锚点：取我们记录的进度和实际位置里【更靠前】的那个 ——
+  // 这样即使 MusicKit 自己回卷到第 1 首，下一首也不会跟着跑到第 2 首。
+  function anchorNext(inst) {
+    const a = actualIdxIn(inst);
+    if (a < 0) return pbCtx.idx;
+    if (pbCtx.idx < 0) { pbCtx.idx = a; return a; }
+    if (a > pbCtx.idx) { pbCtx.idx = a; return a; }
+    return pbCtx.idx;
+  }
+
+  // 「上一首」的锚点：默认从我们记录的进度往回；若原生已经正好退了一首，就认它。
+  function anchorPrev(inst) {
+    const a = actualIdxIn(inst);
+    if (pbCtx.idx < 0) return a;
+    if (a === pbCtx.idx - 1) { pbCtx.idx = a; return a; }
+    return pbCtx.idx;
+  }
+
+  // 换歌（+1 下一首 / -1 上一首）：自己算下标 → 单曲队列 → 验证起点。
+  // 遇到坏曲目继续往前/往后找；连续 5 首都没播起来就停（防无限循环）。
+  // 返回 { ok, via, error, noCtx, atEnd }
+  async function goAdjacent(delta, reason) {
+    const inst = tryMusicKit();
+    if (!inst) return { ok: false, via: '', error: '网页播放器还没就绪', noCtx: true, atEnd: false };
+    const ids = pbCtx.ids;
+    if (!ids.length) return { ok: false, via: '', error: '没有可用的曲目列表（请先播一个歌单）', noCtx: true, atEnd: false };
+
+    // ★ 当前播的这首不在我们的列表里（用户在 Apple 页面自己点的歌）→ 不拿旧进度硬算，
+    //   交给调用方退回原生 skip，免得"下一首"突然跳回上一个歌单。
+    const curId = npId(inst);
+    if (curId && actualIdxIn(inst) < 0) {
+      return { ok: false, via: '', error: '当前曲目不在我们的曲目列表里（' + curId + '）', noCtx: true, atEnd: false };
+    }
+
+    const anchor = delta > 0 ? anchorNext(inst) : anchorPrev(inst);
+    if (anchor < 0) return { ok: false, via: '', error: '当前曲目不在曲目列表里，算不出' + (delta > 0 ? '下一首' : '上一首'), noCtx: true, atEnd: false };
+
+    let i = anchor + delta;
+    if (i < 0 || i >= ids.length) {
+      log('⚠ 已经到' + (delta > 0 ? '最后' : '最前') + '一首了，没有' + (delta > 0 ? '下一首' : '上一首'), 'warn');
+      return { ok: false, via: '', error: '已经到' + (delta > 0 ? '队尾' : '队首') + '了', noCtx: false, atEnd: true };
+    }
+
+    let tries = 0;
+    let lastErr = '';
+    while (i >= 0 && i < ids.length && tries < 5) {
+      const id = String(ids[i]);
+      if (badIds.has(id) || runtimeBadIds.has(id)) {
+        log('    跳过已知无效曲目：' + pbTitleOf(id, inst), 'warn');
+        i += delta;
+        tries += 1;
+        continue;
+      }
+      log('  ▸ ' + (reason || (delta > 0 ? '下一首' : '上一首')) + ' → 第 ' + (i + 1) + '/' + ids.length + ' 首：' + pbTitleOf(id, inst), 'info');
+      if (await playSingleVerified(inst, id, '单曲队列(第 ' + (i + 1) + '/' + ids.length + ' 首)')) {
+        pbCtx.idx = i;
+        pbWrapLogged = '';
+        log('  ✓ 已切到第 ' + (i + 1) + '/' + ids.length + ' 首：' + pbTitleOf(id, inst), 'ok');
+        return { ok: true, via: '单曲队列·自管切歌', error: '', noCtx: false, atEnd: false };
+      }
+      lastErr = 'id ' + id + ' 没播起来';
+      log('    ⚠ 这首没播起来，记为播不动并继续：' + pbTitleOf(id, inst), 'err');
+      runtimeBadIds.add(id);
+      i += delta;
+      tries += 1;
+    }
+    if (tries >= 5) log('⚠ 连续试了 5 首都没播起来，停止继续找（防无限循环）', 'err');
+    return { ok: false, via: '', error: lastErr || '没有可播的曲目', noCtx: false, atEnd: false };
+  }
+
+  // 看门狗 / MusicKit 报错时调用：只向前跳一首，
+  // 绝不 setQueue 重来、绝不回到队首；连续跳过上限 5 首。
+  async function skipBadTrack(reason) {
+    const now = Date.now();
+    if (now - pbSkipAt > 60000) pbSkipStreak = 0;   // 距上次跳过超过 1 分钟 → 重新计数
+    if (pbSkipStreak >= 5) {
+      log('⚠ 已连续跳过 ' + pbSkipStreak + ' 首仍未恢复播放，停止自动跳过（避免无限循环）', 'err');
+      return;
+    }
+    pbSkipStreak += 1;
+    pbSkipAt = now;
+    const inst = tryMusicKit();
+    const cur = npId(inst);
+    const nm = npTitle(inst);
+    log('⚠ 曲目无法播放，已跳到下一首：' + (nm || cur || '(未知曲目)') +
+      '（原因：' + reason + '，连续第 ' + pbSkipStreak + ' 首）', 'warn');
+    if (cur) runtimeBadIds.add(cur);
+    const r = await goAdjacent(1, '跳过无法播放的曲目');
+    if (r.ok) log('    跳过已确认：现在播的是 ' + (npTitle(inst) || npId(inst)), 'ok');
+    else log('    ⚠ 跳过没有成功：' + (r.error || '未知原因'), 'err');
+  }
+
+  // playSongIds(ids, startWith, nameOf)
+  //   nameOf：可选，(id) => '歌名 / 歌手'，只用于把「跳过的失效曲目」打成歌名。
+  //           它只在【本进程】里使用，不会被转发（不会跨 sendChrome 传函数）。
+  async function playSongIds(ids, startWith, nameOf) {
+    const list0 = ids.filter(Boolean).map(String);
+    if (!list0.length) return '失败：没有可播放的曲目（可能都是本地上传）';
+
+    // ★ 先剔除目录里已失效的 id —— 否则 MusicKit 会拒绝【整个队列】(mk-007 NOT_FOUND)。
+    //   这一步放在 PANEL_MODE 转发【之前】：
+    //   面板侧自己就能过滤并在面板日志里打出歌名，页面侧收到的是已经过滤过的列表。
+    const v = await filterPlayableIds(list0);
+    const list = v.ok.length ? v.ok : list0;
+    // ★ 面板转发过来的播放没有 nameOf（函数不能跨进程传）→ 用目录校验顺手留下的名字补上，
+    //   这样"坏曲目跳过"那类日志在页面侧也能打出歌名而不是一坨 id。
+    const nameOfAll = (typeof nameOf === 'function')
+      ? nameOf
+      : function (id) { return (v.names && v.names[String(id)]) || ''; };
+    if (v.bad.length) {
+      v.bad.forEach((id) => badIds.add(String(id)));
+      log('⚠ 跳过 ' + v.bad.length + ' 首目录已失效的曲目：', 'err');
+      v.bad.forEach((id) => {
+        let nm = '';
+        try { nm = String(nameOfAll(id) || ''); } catch (e) { nm = ''; }
+        log('    ' + (nm || id), 'err');
+      });
+    }
+
+    // ★ 调用方【显式指定了起点】，但那一首不在可播放列表里 → 直接提示，什么都不播。
+    //   绝不退回 list[0]：那会让"点坏歌"变成"从第 1 首开始播整个歌单"——
+    //   日志里还写着播的是你点的那首（本项目栽过多次的"报告成功但行为错误"）。
+    //   startWith 为空（= 点歌单的播放按钮）才允许从第 1 首开始。
+    //   位置在 PANEL_MODE 转发【之前】：面板模式没有 MusicKit，
+    //   放后面的话面板会先白跑一次跨进程请求，而且拿回来的日志没有歌名。
+    function nameOrId(id) {
+      let nm = '';
+      try { nm = String(nameOfAll(id) || ''); } catch (e) { nm = ''; }
+      return nm || String(id);
+    }
+    if (startWith && list.indexOf(String(startWith)) < 0) {
+      log('⚠ 这首不在可播放目录里（未播放任何曲目）：' + nameOrId(startWith), 'err');
+      return '失败：这首已不在 Apple Music 目录里（可能已下架或不在当前区），换下一首试试（' +
+        nameOrId(startWith) + '）';
+    }
+
+    /* 独立面板窗口没有 MusicKit —— 把播放指令转给网页执行（转的是过滤后的列表） */
+    if (PANEL_MODE) return await playViaPage(list, startWith);
+
+    const inst = tryMusicKit();
+    if (!inst) return '失败：播放器未就绪（' + mkDiag() + '）';
+
+    const target = startWith ? String(startWith) : list[0];
+
+    // ★ 记下这一份「经过校验的曲目列表 + 起点下标」：
+    //   起点校正 / 下一首 / 上一首 / 自动续播 / 跳过坏曲目，全都按这个列表算。
+    const ti = list.indexOf(target);
+    setPlayCtx(list, ti < 0 ? 0 : ti, nameOfAll);
+    log('准备播放：队列 ' + list.length + ' 首，起点索引 ' + (ti < 0 ? 0 : ti) + ' → ' + target, 'info');
+    // ★ startWith 才是 MusicKit JS v3 真正认的参数名（源码里 startWithSong 一次都没出现，
+    //   传了等于没传 —— 这也解释了"去掉 startWithSong 没变化"）。
+    log('    （起点用 startWith 指定；整单队列起点若验证不过会自动改走单曲队列）', 'info');
+
+    // ★ 三条路按顺序试，每一步都用 nowPlayingItem.id 验证，不过就继续往下走：
+    //   ① 整单队列（保留完整队列语义：原生自动续播、Apple 自己的上一首/下一首都好用）
+    //   ② 起点校正：changeToMediaAtIndex(目标在【真实队列】里的下标)
+    //   ③ 单曲队列：起点完全由我们掌控（实测这条路径从未播错过歌）
+    // 不再把目标旋转到数组最前面 —— 那会让「下一首」变成歌单第 1 首。
+    let via = '';
+    let built = false;
+    if (list.length > 1) {
+      built = await tryQueue(inst, { songs: list, startWith: target }, '整单队列(' + list.length + '首, startWith)');
+      if (!built) built = await tryQueue(inst, { songs: list }, '整单队列(不带 startWith 重试)');
+      if (built && await playAndVerify(inst, target)) via = '整单队列';
+      if (!via && built) {
+        log('  ▸ 整单队列起点不对 → 用 changeToMediaAtIndex 校正起点 …', 'warn');
+        if (await correctQueueStart(inst, target)) via = '整单队列(已校正起点)';
+      }
+    }
+
+    if (!via) {
+      if (list.length > 1) {
+        log('  ▸ 整单队列' + (built ? '起点无法校正' : '没建成') +
+          ' → 改用单曲队列（起点优先，代价是失去整单队列）', 'warn');
+      }
+      if (await playSingleVerified(inst, target, '单曲队列')) via = '单曲队列(自管下一首)';
+    }
+
+    if (!via) {
+      const cur = npId(inst);
+      return '失败：起点未落在目标曲目（目标 ' + target + '，实际 ' + (cur || '读不到') + '）';
+    }
+    pbCtx.idx = ti < 0 ? 0 : ti;
+    pbWrapLogged = '';
+    log('播放已确认：nowPlaying=' + target + '（路径：' + via + '）' +
+      (via.indexOf('单曲') === 0 ? '；下一首/上一首由本扩展接管' : ''), 'ok');
+    return 'MusicKit · ' + via;
   }
 
   // 播放一首（条目来自 API）
   async function playItem(item) {
     const cid = catalogIdOf(item);
     if (!cid) return '失败：这首没有目录 ID（可能是本地上传，接口无法播放）';
-    return playSongIds([cid]);
+    return playSongIds([cid], null, nameMapperOf([item]));
   }
 
   // 给返回值也加超时（防止 fetch / MusicKit 永不 settle）
@@ -584,7 +1040,157 @@
     }
     const ids = tracks.map(catalogIdOf).filter(Boolean);
     if (!ids.length) return '失败：这个歌单没有可播放的曲目';
-    return playSongIds(ids);
+    return playSongIds(ids, null, nameMapperOf(tracks));
+  }
+
+  /* ============== 播放卡死看门狗（只在网页模式跑） ==============
+   * 有些曲目（例如只有库内 id、没有 catalogId 的）队列能建成功，
+   * 但播到它就一直卡住：currentPlaybackTime 不前进。
+   * 这里每 3 秒看一眼：
+   *   a) 处于「应该正在播」状态、位置连续 2 次（约 6 秒）都没动 → 跳到下一首，并记一笔日志。
+   *   b) ★ 新增：曲目换了但【一直没起播】（isPlaying=false、位置 0，约 9 秒）
+   *      → 同样判定播不动。旧版这里直接 return，所以"坏曲目根本没起播"永远跳不过去。
+   * 跳转一律走 skipBadTrack → goAdjacent(+1)：自己算下标 + 单曲队列 + 验证起点，
+   * 绝不 setQueue 重来、绝不回到队首，连续跳过上限 5 首。
+   * ★ 暂停/未播放时位置本来就不动，只在 isPlaying === true 或状态明确时才判定。
+   * ========================================================== */
+  let stallTimer = null;
+
+  /* 挂 MusicKit 事件（坏曲目最可靠的检测方式，而且比 3 秒轮询快）
+   * 事件名 / 回调签名都来自 MusicKit JS v3 源码：
+   *   mediaPlaybackError  → 回调收到一个 MKError（.message）
+   *   playbackStateDidChange → 回调收到 { oldState, state, nowPlayingItem }
+   *   PlaybackStates: 5=ended 10=completed 3=paused
+   * MusicKit 实例可能到得比看门狗晚，所以在轮询里补挂。 */
+  function mountPlaybackListeners(inst) {
+    if (pbListenersMounted || !inst || typeof inst.addEventListener !== 'function') return false;
+    pbListenersMounted = true;
+
+    try {
+      inst.addEventListener('mediaPlaybackError', function (e) {
+        const msg = (e && (e.message || e.description)) || String(e || '');
+        log('⚠ MusicKit 报播放错误：' + msg, 'err');
+        skipBadTrack('mediaPlaybackError');
+      });
+      log('已监听 MusicKit 事件：mediaPlaybackError（坏曲目即时跳到下一首）', 'info');
+    } catch (e) {
+      log('监听 mediaPlaybackError 失败：' + ((e && e.message) || e), 'warn');
+    }
+
+    try {
+      inst.addEventListener('playbackStateDidChange', function (ev) {
+        let st = -1;
+        try { st = ev && typeof ev.state === 'number' ? ev.state : inst.playbackState; } catch (e) { st = -1; }
+        if (st !== 5 && st !== 10) return;        // 只关心 5=ended / 10=completed
+        if (!pbCtx.ids.length) return;
+        if (queueLen(inst) > 1) return;           // 整单队列：MusicKit 自己会接下一首，别抢
+        if (pbAdvancing) return;
+        const before = npId(inst);
+        pbAdvancing = true;
+        setTimeout(async () => {
+          try {
+            let playingNow = false;
+            try { playingNow = inst.isPlaying === true; } catch (e) {}
+            const idNow = npId(inst);
+            // ★ state=5 是明确的「这首歌播完了」：即使 isPlaying 还没翻成 false（状态回读有延迟），
+            //   也应该续播；state=10(completed) 则要确认确实没在播、曲目也没变。
+            const ended = st === 5 && idNow === before;
+            if (!ended && (playingNow || (idNow && idNow !== before))) return;   // 已经自己续上了
+            log('▶ 当前曲目已播完（playbackState=' + st + '），自动续播下一首', 'info');
+            await goAdjacent(1, '自动续播');
+          } finally {
+            pbAdvancing = false;
+          }
+        }, 800);
+      });
+      log('已监听 MusicKit 事件：playbackStateDidChange（单曲队列播完自动续下一首）', 'info');
+    } catch (e) {
+      log('监听 playbackStateDidChange 失败：' + ((e && e.message) || e), 'warn');
+    }
+    return true;
+  }
+
+  function startStallWatchdog() {
+    if (PANEL_MODE || stallTimer) return;
+    let lastPos = -1;
+    let still = 0;
+    let lastSkip = 0;
+    let lastId = '';
+    let notStarted = 0;
+    stallTimer = setInterval(() => {
+      let inst = null;
+      try { inst = tryMusicKit(); } catch (e) { inst = null; }
+      if (!inst) { lastPos = -1; still = 0; notStarted = 0; return; }
+      mountPlaybackListeners(inst);      // MusicKit 可能到得比看门狗晚，这里补挂事件
+      let playing = false;
+      let pos = 0;
+      let np = null;
+      let st = -1;
+      try {
+        playing = inst.isPlaying === true;
+        pos = Number(inst.currentPlaybackTime) || 0;
+        np = inst.nowPlayingItem || null;
+        st = inst.playbackState;
+      } catch (e) { return; }
+      const id = np && np.id ? String(np.id) : '';
+      syncCtxIdx(inst);                  // 让我们的进度跟上实际播放（会忽略"回卷到第 1 首"）
+
+      // 用户主动暂停（3=paused）→ 位置本来就不动，绝不能误判成坏曲目
+      if (st === 3) { lastPos = -1; still = 0; notStarted = 0; return; }
+
+      // 没在播放（暂停/停止/没队列）→ 位置本来就不动，绝不能误判
+      if (!playing || !np) {
+        if (!id) { lastPos = -1; still = 0; notStarted = 0; return; }
+        if (id !== lastId) { lastId = id; notStarted = 0; lastPos = -1; still = 0; return; }
+        // 队尾不跳：整张歌单播完后 isPlaying 也会变 false，那不是坏曲目。
+        // ★ 判据用【我们自己的曲目列表下标】：单曲队列模式下 MusicKit 的 queue 长度永远是 1，
+        //   拿它判断会永远命中"队尾"，坏曲目就再也跳不了了（这个坑是回归测试抓出来的）。
+        const ai = actualIdxIn(inst);
+        const curIdx = ai >= 0 ? ai : pbCtx.idx;
+        if (pbCtx.ids.length && curIdx >= pbCtx.ids.length - 1) { notStarted = 0; lastPos = -1; still = 0; return; }
+        if (!pbCtx.ids.length) {
+          // 没有我们的列表（用户在网页自己点的歌）→ 退回看真实队列的位置
+          const qi = queueIndexOf(inst, id);
+          const ql = queueLen(inst);
+          if (qi >= 0 && ql > 0 && qi >= ql - 1) { notStarted = 0; lastPos = -1; still = 0; return; }
+        }
+        if (st === 0) { lastPos = -1; still = 0; return; }   // 压根没有队列 / 没在播放
+        // ★ 曲目已经换到这首、却一直没起播 → 典型是"坏到根本没播放资源"
+        notStarted += 1;
+        // 1=loading / 8=waiting / 9=stalled 有可能是网络慢，多给两个周期（约 12 秒）再判死
+        const need = (st === 1 || st === 8 || st === 9) ? 4 : 2;
+        if (notStarted < need) return;   // 一般约 6 秒，卡在缓冲时约 12 秒
+        notStarted = 0;
+        lastPos = -1;
+        still = 0;
+        if (Date.now() - lastSkip < 8000) return;
+        lastSkip = Date.now();
+        log('⚠ 当前曲目一直没起播（isPlaying=false，位置 ' + pos.toFixed(1) + '，playbackState=' + st + '）', 'warn');
+        skipBadTrack('一直没有起播');
+        return;
+      }
+
+      // 已经播起来了 → 清掉「未起播」计数
+      notStarted = 0;
+      if (id && id !== lastId) lastId = id;
+      if (pbSkipStreak > 0 && pos > 1) {
+        log('播放已恢复，连续跳过计数清零（之前连续跳过了 ' + pbSkipStreak + ' 首）', 'info');
+        pbSkipStreak = 0;
+      }
+
+      if (lastPos >= 0 && Math.abs(pos - lastPos) < 0.05) still += 1;
+      else still = 0;
+      lastPos = pos;
+      if (still < 2) return;
+      still = 0;
+      lastPos = -1;
+      if (Date.now() - lastSkip < 8000) return;   // 刚跳过，给新曲目留出起播时间
+      lastSkip = Date.now();
+      const nm = (np.attributes && np.attributes.name) || '';
+      log('⚠ 当前曲目卡住，已跳到下一首' + (nm ? '（' + nm + '）' : ''), 'warn');
+      // ★ 走自己算下标的跳过逻辑：绝不 setQueue 重来，也绝不回到队首
+      skipBadTrack('播放位置长时间不动');
+    }, 3000);
   }
 
   // 检测是否停在失效地址：把「资料库歌单 ID」(p.xxx) 当公开歌单地址用，
@@ -752,6 +1358,7 @@
     background:#2b3d2b;color:#7dd88b}
   .tag.rec{background:#2b3550;color:#8ab6ff}
   .tag.pub{background:#3a3320;color:#e0c37a}
+  .tag.bad{background:#4a2a2a;color:#f0a0a0}
   .prog{margin-top:10px;height:5px;border-radius:3px;background:#242430;overflow:hidden;display:none}
   .prog.on{display:block}
   .prog i{display:block;height:100%;width:0;background:#0a84ff;transition:width .25s}
@@ -1157,9 +1764,9 @@
       b.onclick = fn;
       return b;
     };
-    tp.appendChild(mkBtn('⏮', '上一首', () => ctrl((i) => { if (i.skipToPreviousItem) i.skipToPreviousItem(); }, 'prev')));
+    tp.appendChild(mkBtn('⏮', '上一首', () => ctrlStep(-1, 'prev')));
     tp.appendChild(mkBtn('⏯', '播放 / 暂停', () => ctrl((i) => { if (i.isPlaying) i.pause(); else i.play(); }, 'toggle')));
-    tp.appendChild(mkBtn('⏭', '下一首', () => ctrl((i) => { if (i.skipToNextItem) i.skipToNextItem(); }, 'next')));
+    tp.appendChild(mkBtn('⏭', '下一首', () => ctrlStep(1, 'next')));
     const np = document.createElement('div');
     np.className = 'np';
     np.id = 'npText';
@@ -1305,6 +1912,10 @@
     body.innerHTML = '';
     const ro = !canEditPl(pl);
 
+    // id → 歌名：播放时若需要跳过失效曲目，日志里就能直接打歌名（而不是数字 id）。
+    // 这里只做映射，不额外发任何请求。
+    const nameOfId = nameMapperOf(tracks);
+
     if (ro) {
       const w = document.createElement('div');
       w.className = 'empty';
@@ -1427,11 +2038,28 @@
       const im = document.createElement('img');
       const u = art(a, '60x60');
       if (u) im.src = u;
+
+      // ★ 可疑曲目标记（只标记，不剔除，也不为此多发任何请求）：
+      //   ① 实证：播放时被目录接口判定失效、已经跳过过 → 记在 badIds
+      //   ② 启发式：没有 artwork，很可能没有目录封面 → 可能无法播放
+      const cid0 = catalogIdOf(t);
+      const warnText = cid0 && badIds.has(String(cid0))
+        ? '⚠ 目录已失效（播放时已跳过）'
+        : (!u ? '⚠ 目录封面缺失，可能无法播放' : '');
+      if (warnText) row.title = warnText;
+
       const m = document.createElement('div');
       m.className = 'm';
       const n1 = document.createElement('div');
       n1.className = 'nm';
       n1.textContent = idx + 1 + '. ' + (a.name || '');
+      if (warnText) {
+        const wt = document.createElement('span');
+        wt.className = 'tag bad';
+        wt.textContent = '⚠';
+        wt.title = warnText;
+        n1.appendChild(wt);
+      }
       const n2 = document.createElement('div');
       n2.className = 'sub';
       n2.textContent = [a.artistName, a.albumName].filter(Boolean).join(' · ');
@@ -1446,9 +2074,19 @@
         play.disabled = true;
         try {
           const cid = catalogIdOf(t);
+          // ★ 没有目录 ID：这首播不了 → 只记日志，【绝不碰播放队列】。
+          //   旧代码走 playItem（失败）后不 return，仍会走到下面的 playSongIds，
+          //   于是拿整个歌单建队列 → 从第 1 首开始播。
+          if (!cid) {
+            const nm = [a.name, a.artistName].filter(Boolean).join(' / ');
+            log('⚠ 这首无法播放（没有目录 ID，可能是本地上传）：' + (nm || '（未知曲目）') +
+              '（未播放任何曲目）', 'err');
+            return;
+          }
           const ids = (tracks || []).map(catalogIdOf).filter(Boolean);
-          const kind = cid && ids.length ? await playSongIds(ids, cid) : await playItem(t);
-          log(`播放 ${a.name} → ${kind}`, kind.indexOf('失败') === 0 ? 'err' : 'ok');
+          const kind = cid && ids.length ? await playSongIds(ids, cid, nameOfId) : await playItem(t);
+          const failed = kind.indexOf('失败') === 0;
+          log(`播放 ${a.name} → ${kind}`, failed ? 'err' : 'ok');
         } catch (e) {
           log('播放出错：' + ((e && e.message) || e), 'err');
         } finally {
@@ -1953,6 +2591,8 @@
      * 网页里再挂一颗球只是重复。
      * --------------------------------------------- */
     maybeOpenPanelFromHash();
+    // 播放卡死看门狗：只在网页侧跑（面板窗口没有 MusicKit）
+    startStallWatchdog();
   }
 
   /* ============ 桌面悬浮球用 #am-panel 请求打开面板窗口 ============

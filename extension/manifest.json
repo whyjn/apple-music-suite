@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Apple Music 歌单管家",
-  "version": "3.6.0",
+  "version": "3.8.0",
   "description": "Apple Music 歌单管家 —— 独立歌单小窗口 + 桌面悬浮球。",
   "icons": {
     "128": "icon128.png"
