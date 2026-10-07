@@ -717,6 +717,43 @@ try {
         })
     $menu.Items.Add($miDiag) | Out-Null
 
+    # ---- 查看最近操作（排错用：球的操作日志在这里，不依赖面板）----
+    $miLog = New-Object System.Windows.Controls.MenuItem
+    $miLog.Header = '查看最近操作'
+    $miLog.Add_Click({
+            try {
+                $lines = @(Get-Content -LiteralPath $LogFile -Tail 20 -Encoding UTF8 -ErrorAction SilentlyContinue)
+                $body = if ($lines.Count) { $lines -join "`r`n" } else { '（日志还是空的）' }
+
+                $w = New-Object System.Windows.Window
+                $w.Title = '悬浮球 · 最近操作（可选中复制）'
+                $w.Width = 520
+                $w.Height = 380
+                $w.WindowStartupLocation = 'CenterScreen'
+                $w.Topmost = $true
+                $w.Background = New-Brush 255 26 26 30
+
+                $tb = New-Object System.Windows.Controls.TextBox
+                $tb.Text = $body
+                $tb.IsReadOnly = $true
+                $tb.FontFamily = 'Consolas'
+                $tb.FontSize = 12
+                $tb.Foreground = New-Brush 255 222 222 228
+                $tb.Background = New-Brush 255 26 26 30
+                $tb.BorderThickness = 0
+                $tb.Padding = '8,6,8,6'
+                $tb.TextWrapping = 'NoWrap'
+                $tb.VerticalScrollBarVisibility = 'Auto'
+                $tb.HorizontalScrollBarVisibility = 'Auto'
+
+                $w.Content = $tb
+                $w.ShowDialog() | Out-Null
+            } catch {
+                Write-Log "查看最近操作失败: $($_.Exception.Message)"
+            }
+        })
+    $menu.Items.Add($miLog) | Out-Null
+
     $menu.Items.Add((New-Object System.Windows.Controls.Separator)) | Out-Null
 
     $mi = New-Object System.Windows.Controls.MenuItem; $mi.Header = '退出悬浮球'

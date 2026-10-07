@@ -226,6 +226,24 @@
     return '网页 MusicKit';
   }
 
+  // 找 Apple Music 网页【自己的】上一首/下一首按钮。
+  // 用途：MusicKit 的 skipToNextItem() 有可能静默无效，兜底直接点真实按钮。
+  function findTransportBtn(a) {
+    const want = a === 'next' ? /next|下一首|下一曲/i : /prev|previous|上一首|上一曲/i;
+    const all = document.querySelectorAll('button, [role="button"]');
+    for (const b of all) {
+      const txt = String(b.className || '') + ' ' +
+        (b.getAttribute && (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || ''));
+      if (want.test(txt) && !b.disabled) return b;
+    }
+    // 退而求其次：播放控制条里按位置取（首=上一首，尾=下一首）
+    const bar = document.querySelector('[class*="playback-controls"]');
+    if (bar) {
+      const bs = [...bar.querySelectorAll('button')].filter((x) => !x.disabled);
+      if (bs.length >= 3) return a === 'next' ? bs[bs.length - 1] : bs[0];
+    }
+    return null;
+  }
   async function pageTransport(action) {
     if (!action) return { ok: false, error: '未知控制指令' };
     const r = await sendChrome({ type: 'am-transport', action: action });
@@ -259,17 +277,42 @@
 
       if (d.__am_transport_req__) {
         const req = d.__am_transport_req__;
-        (function () {
-          const out = { reqId: req.reqId, ok: false, error: null };
+        (async function () {
+          const out = { reqId: req.reqId, ok: false, error: null, via: null };
           try {
             const inst = tryMusicKit();
             if (!inst) throw new Error('网页播放器还没就绪，请先在页面底部播放一次');
             const a = req.action;
-            if (a === 'toggle') { if (inst.isPlaying) inst.pause(); else inst.play(); }
-            else if (a === 'next') { if (inst.skipToNextItem) inst.skipToNextItem(); }
-            else if (a === 'prev') { if (inst.skipToPreviousItem) inst.skipToPreviousItem(); }
-            else throw new Error('未知指令 ' + a);
-            out.ok = true;
+
+            if (a === 'toggle') {
+              if (inst.isPlaying) await inst.pause(); else await inst.play();
+              out.ok = true; out.via = 'MusicKit';
+            } else if (a === 'next' || a === 'prev') {
+              // ★ 不再无条件报成功：记录调用前的曲目，调用后【验证是否真的换了】
+              const before = (inst.nowPlayingItem && inst.nowPlayingItem.id) || '';
+              try {
+                if (a === 'next') { if (inst.skipToNextItem) await inst.skipToNextItem(); }
+                else { if (inst.skipToPreviousItem) await inst.skipToPreviousItem(); }
+              } catch (e) { out.error = String((e && e.message) || e); }
+              await new Promise((r) => setTimeout(r, 700));
+
+              const after = (inst.nowPlayingItem && inst.nowPlayingItem.id) || '';
+              if (after && after !== before) { out.ok = true; out.via = 'MusicKit'; }
+              else {
+                // MusicKit 没动 → 直接点网页自己的按钮（最可靠）
+                const el = findTransportBtn(a);
+                if (!el) {
+                  out.error = (out.error ? out.error + '；' : '') +
+                    'MusicKit 未换歌，且找不到网页的' + (a === 'next' ? '下一首' : '上一首') + '按钮';
+                } else {
+                  el.click();
+                  await new Promise((r) => setTimeout(r, 700));
+                  const a2 = (inst.nowPlayingItem && inst.nowPlayingItem.id) || '';
+                  if (a2 && a2 !== before) { out.ok = true; out.via = '网页按钮'; }
+                  else out.error = 'MusicKit 和网页按钮都没能换歌（可能已在队列首/尾）';
+                }
+              }
+            } else throw new Error('未知指令 ' + a);
           } catch (e) {
             out.error = String((e && e.message) || e);
           }
@@ -436,7 +479,7 @@
     if (PANEL_MODE) {
       pageTransport(action).then((r) => {
         if (!r || !r.ok) log('播放控制失败：' + ((r && r.error) || '网页端未响应'), 'err');
-        else log('播放控制：' + action, 'ok');
+        else log('播放控制：' + action + (r.via ? '（' + r.via + '）' : ''), 'ok');
         setTimeout(() => {
           const el = $('npText');
           if (el) el.textContent = playStateText();
